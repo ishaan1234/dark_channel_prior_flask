@@ -295,6 +295,9 @@ def home():
         </body>
     </html>
     '''
+@app.route('/test', methods=['GET'])
+def test():
+    return jsonify({'status': 'API is working!'})
 
 if __name__ == '__main__':
     # This is used when running locally only. When deploying to Google Cloud Run,
