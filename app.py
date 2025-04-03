@@ -1,19 +1,23 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, redirect
 import cv2
 import numpy as np
 import os
 import uuid
 import tempfile
 from werkzeug.utils import secure_filename
+import io
 
 app = Flask(__name__)
 
 # Configuration
-UPLOAD_FOLDER = 'uploads'
-PROCESSED_FOLDER = 'processed'
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'wmv'}
 
-# Create directories if they don't exist
+# Create a temp directory for the duration of the instance
+TEMP_DIR = tempfile.mkdtemp()
+UPLOAD_FOLDER = os.path.join(TEMP_DIR, 'uploads')
+PROCESSED_FOLDER = os.path.join(TEMP_DIR, 'processed')
+
+# Create directories
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(PROCESSED_FOLDER, exist_ok=True)
 
@@ -143,12 +147,12 @@ def process_video():
         input_filename = secure_filename(file.filename)
         base_filename, extension = os.path.splitext(input_filename)
         
-        # Save the uploaded file
+        # Set file paths
         input_path = os.path.join(UPLOAD_FOLDER, f"{base_filename}_{unique_id}{extension}")
-        file.save(input_path)
-        
-        # Set output path
         output_path = os.path.join(PROCESSED_FOLDER, f"{base_filename}_dehazed_{unique_id}{extension}")
+        
+        # Save the uploaded file
+        file.save(input_path)
         
         try:
             # Process the video
@@ -175,7 +179,13 @@ def process_video():
             video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
             
             # Process each frame
-            while True:
+            frame_count = 0
+            max_frames = int(video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            # Process up to 1800 frames (about 1 minute at 30fps) to avoid timeout
+            max_frames = min(max_frames, 1800)
+            
+            while frame_count < max_frames:
                 ret, frame = video_capture.read()
                 if not ret:
                     break
@@ -185,14 +195,20 @@ def process_video():
                 
                 # Write the processed frame to the output video
                 out.write(dehazed_frame)
+                frame_count += 1
             
             # Release resources
             video_capture.release()
             out.release()
             
-            # Return the URL where the processed video can be accessed
+            # Generate a video URL that points to our server
             video_url = f"/get_processed_video/{os.path.basename(output_path)}"
             
+            # If this was a request from the web form, redirect to the result
+            if request.headers.get('Accept', '').find('text/html') != -1:
+                return redirect(f'/result?video_url={video_url}')
+            
+            # Otherwise return JSON for API clients
             return jsonify({
                 'success': True, 
                 'message': 'Video processed successfully',
@@ -200,13 +216,51 @@ def process_video():
             })
             
         except Exception as e:
+            # Clean up the input file in case of error
+            try:
+                os.remove(input_path)
+            except:
+                pass
+                
             return jsonify({'error': f'Error processing video: {str(e)}'}), 500
             
     return jsonify({'error': 'File type not allowed'}), 400
 
 @app.route('/get_processed_video/<filename>', methods=['GET'])
 def get_processed_video(filename):
-    return send_file(os.path.join(PROCESSED_FOLDER, filename), as_attachment=True)
+    return send_file(os.path.join(PROCESSED_FOLDER, filename), 
+                    mimetype='video/mp4', 
+                    as_attachment=True, 
+                    download_name=filename)
+
+@app.route('/result', methods=['GET'])
+def result():
+    video_url = request.args.get('video_url', '')
+    return f'''
+    <html>
+        <head>
+            <title>Fog Removal Result</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 40px; }}
+                h1 {{ color: #333366; }}
+                .video-container {{ margin: 20px 0; }}
+            </style>
+        </head>
+        <body>
+            <h1>Fog Removal Result</h1>
+            <div class="video-container">
+                <video width="640" height="480" controls>
+                    <source src="{video_url}" type="video/mp4">
+                    Your browser does not support the video tag.
+                </video>
+            </div>
+            <p>
+                <a href="/">Process another video</a> | 
+                <a href="{video_url}" download>Download processed video</a>
+            </p>
+        </body>
+    </html>
+    '''
 
 @app.route('/', methods=['GET'])
 def home():
@@ -218,7 +272,8 @@ def home():
                 body { font-family: Arial, sans-serif; margin: 40px; }
                 h1 { color: #333366; }
                 form { margin: 20px 0; }
-                .result { margin-top: 20px; }
+                .info { margin: 20px 0; color: #666; }
+                .warning { color: #cc3300; }
             </style>
         </head>
         <body>
@@ -232,12 +287,17 @@ def home():
                     <button type="submit">Process Video</button>
                 </div>
             </form>
+            <div class="info">
+                <p>This API removes fog from videos using a visibility restoration algorithm.</p>
+                <p class="warning">Note: Processing may take several minutes depending on video length and resolution.</p>
+                <p class="warning">For best results, use videos under 1 minute in length.</p>
+            </div>
         </body>
     </html>
     '''
 
-
 if __name__ == '__main__':
-    # app.run(debug=True, host='0.0.0.0', port=5000)
+    # This is used when running locally only. When deploying to Google Cloud Run,
+    # a webserver process such as Gunicorn will serve the app.
     PORT = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=PORT, debug=False)
